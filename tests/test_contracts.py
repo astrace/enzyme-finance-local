@@ -50,6 +50,11 @@ def enzyme_core_contracts():
     external_position_manager = _deploy(ExternalPositionManager, fund_deployer, external_position_factory, policy_manager)
 
     value_interpreter = _deploy(ValueInterpreter, fund_deployer, WETH, ONE_DAY_IN_SECONDS)
+    # add primitive to allow USDT
+    # NOTE: If you are going to use any denominationa asset other than WETH,
+    #       you must call this function and add the appropriate aggregator !!!
+    value_interpreter.addPrimitives([USDT], ["0x3E7d1eAB13ad0104d2750B8863b489D65364e32D"], [1])
+
     integration_manager =  _deploy(IntegrationManager, fund_deployer, policy_manager, value_interpreter)
 
     protocol_fee_reserve = _deploy(ProtocolFeeReserveLib)
@@ -88,7 +93,7 @@ def enzyme_core_contracts():
 def new_fund(enzyme_core_contracts):
     fund_deployer = enzyme_core_contracts["fund_deployer"]
     tx = fund_deployer.createNewFund(
-        accounts[0], "MyFund", "XYZ", WETH, 0, b'', b'',
+        accounts[0], "MyFund", "XYZ", USDT, 0, b'', b'',
         {"from": accounts[0]}
     )
     assert "NewFundCreated" in tx.events
@@ -107,7 +112,7 @@ def _buy_USDT(Contract, web3, chain, account):
     # params
     amountOutMin = 0
     path = [WETH, USDT]
-    to = account.address
+    to = account
     deadline = chain.time() + ONE_DAY_IN_SECONDS
     value = Wei("1 ether")
 
@@ -116,16 +121,36 @@ def _buy_USDT(Contract, web3, chain, account):
         amountOutMin, path, to, deadline,
         {'from': account, 'value': value}
     )
-    assert Contract.from_explorer(USDT).balanceOf(account.address) > 0
+    assert Contract.from_explorer(USDT).balanceOf(account) > 0
 
 
 def test_buy_shares(Contract, web3, chain, new_fund):
-    _buy_USDT(Contract, web3, chain, accounts[0])
+    buyer = web3.eth.accounts[0]
+
+    _buy_USDT(Contract, web3, chain, buyer)
     
     abi = open("./abis/comptroller_lib.abi").read().strip()
     comptroller_proxy_contract = web3.eth.contract(
         address=new_fund.comptrollerProxy,
         abi=abi
     )
-    #buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)
+    # approve before buying
+    amount = 1_000 * 1_000_000
+    usdt_contract = Contract.from_explorer(USDT)
+    tx1 = usdt_contract.approve(
+        new_fund.comptrollerProxy, amount,
+        {'from': buyer}
+    )
+    assert usdt_contract.allowance(buyer, new_fund.comptrollerProxy) == amount
+    
+    # buy shares
+    comptroller_proxy_contract.functions.buyShares(amount, 5).transact({'from': buyer, 'gas_limit': 500_000})
+
+    # check balance
+    abi = open("./abis/vault_lib.abi").read().strip()
+    vault_proxy_contract = web3.eth.contract(
+        address=new_fund.vaultProxy,
+        abi=abi
+    )
+    assert vault_proxy_contract.functions.balanceOf(buyer).call() > 0
 
