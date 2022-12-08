@@ -1,5 +1,9 @@
 Setting up local enzyme finance protocol instance for testing
 
+## Prerequisites
+
+- [Install Python Brownie](https://eth-brownie.readthedocs.io/en/stable/install.html)
+
 ## Testing
 
 0. Add desired test cases in `./tests/test_contracts.py`
