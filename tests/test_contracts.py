@@ -8,10 +8,11 @@ from brownie import (
     IntegrationManager, PolicyManager, ComptrollerLib,
     ProtocolFeeReserveLib, ExternalPositionManager,
     ProtocolFeeTracker, VaultLib, ProtocolFeeTracker,
+    UniswapV3Adapter,
     accounts, Wei
 )
 from collections import namedtuple
-from eth_abi import encode
+from eth_abi import encode_abi
 
 ONE_DAY_IN_SECONDS = 86_400
 
@@ -25,6 +26,7 @@ RELAY_HUB = "0x9e59Ea5333cD4f402dAc320a04fafA023fe3810D"
 TRUSTED_FORWARDER = "0xAa3E82b4c4093b4bA13Cb5714382C99ADBf750cA"
 
 UNISWAP_V2_ROUTER_02 = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
 
 DEPLOYMENT_ACCOUNT = accounts.load('deployment_account')
 
@@ -57,6 +59,8 @@ def enzyme_core_contracts():
 
     integration_manager =  _deploy(IntegrationManager, fund_deployer, policy_manager, value_interpreter)
 
+    uniswap_v3_adapter = _deploy(UniswapV3Adapter, integration_manager.address, UNISWAP_V3_ROUTER)
+
     protocol_fee_reserve = _deploy(ProtocolFeeReserveLib)
     fee_manager = _deploy(FeeManager, fund_deployer)
 
@@ -86,7 +90,9 @@ def enzyme_core_contracts():
     fund_deployer.setReleaseLive({'from': DEPLOYMENT_ACCOUNT})
 
     return {
-        "fund_deployer": fund_deployer
+        "fund_deployer": fund_deployer,
+        "integration_manager": integration_manager,
+        "uniswap_v3_adapter": uniswap_v3_adapter
     }
 
 @pytest.fixture
@@ -101,14 +107,18 @@ def new_fund(enzyme_core_contracts):
     vault = Vault(event["creator"], event["vaultProxy"], event["comptrollerProxy"]) 
     return vault
 
-def _buy_USDT(Contract, web3, chain, account):
+def _buy_USDT(Contract, web3, chain, account, eth_value):
 
-    # approve 1MM USD
     usdt_contract = Contract.from_explorer(USDT)
-    tx1 = usdt_contract.approve(
-        UNISWAP_V2_ROUTER_02, 1_000_000 * 1_000_000,
-        {'from': account}
-    )
+    
+    # check allowance
+    if usdt_contract.allowance(account, UNISWAP_V2_ROUTER_02) == 0:
+        # infinite approve
+        usdt_contract.approve(
+            UNISWAP_V2_ROUTER_02, 2**256 - 1,
+            {'from': account}
+        )
+    
     # params
     amountOutMin = 0
     path = [WETH, USDT]
@@ -123,34 +133,89 @@ def _buy_USDT(Contract, web3, chain, account):
     )
     assert Contract.from_explorer(USDT).balanceOf(account) > 0
 
+def _get_comptroller(web3, fund):
+    abi = open("./abis/comptroller_lib.abi").read().strip()
+    comptroller_proxy_contract = web3.eth.contract(
+        address=fund.comptrollerProxy,
+        abi=abi
+    )
+    return comptroller_proxy_contract
 
-def test_buy_shares(Contract, web3, chain, new_fund):
-    buyer = web3.eth.accounts[0]
+def _buy_shares(Contract, web3, chain, fund, buyer, amount):
 
-    _buy_USDT(Contract, web3, chain, buyer)
+    _buy_USDT(Contract, web3, chain, buyer, Wei("100 ether"))
     
     abi = open("./abis/comptroller_lib.abi").read().strip()
     comptroller_proxy_contract = web3.eth.contract(
-        address=new_fund.comptrollerProxy,
+        address=fund.comptrollerProxy,
         abi=abi
     )
     # approve before buying
-    amount = 1_000 * 1_000_000
     usdt_contract = Contract.from_explorer(USDT)
-    tx1 = usdt_contract.approve(
-        new_fund.comptrollerProxy, amount,
+    usdt_contract.approve(
+        fund.comptrollerProxy, amount,
         {'from': buyer}
     )
-    assert usdt_contract.allowance(buyer, new_fund.comptrollerProxy) == amount
+    assert usdt_contract.allowance(buyer, fund.comptrollerProxy) == amount
     
     # buy shares
-    comptroller_proxy_contract.functions.buyShares(amount, 5).transact({'from': buyer, 'gas_limit': 500_000})
+    comptroller_proxy_contract.functions.buyShares(amount, 1).transact({'from': buyer})
 
     # check balance
     abi = open("./abis/vault_lib.abi").read().strip()
     vault_proxy_contract = web3.eth.contract(
-        address=new_fund.vaultProxy,
+        address=fund.vaultProxy,
         abi=abi
     )
-    assert vault_proxy_contract.functions.balanceOf(buyer).call() > 0
+    return vault_proxy_contract.functions.balanceOf(buyer).call()
+
+def test_buy_shares(Contract, web3, chain, new_fund):
+    buyer = web3.eth.accounts[0]
+    amount = 1_000 * 1_000_000
+    ret =_buy_shares(Contract, web3, chain, new_fund, buyer, amount)
+    assert ret == amount * 10 ** 12
+
+def test_make_trade(Contract, web3, chain, enzyme_core_contracts, new_fund):
+    # first, deposit some money into fund via buying shares
+    buyer = web3.eth.accounts[0]
+    amount = 1_000 * 1_000_000
+    ret =_buy_shares(Contract, web3, chain, new_fund, buyer, amount)
+    
+    ### set up input to trade function
+
+    # integrationData
+    pathAddresses = [USDT, WETH]
+    pathFees = [500]
+    outgoingAssetAmount = 500_000_000 # 500 USDT
+    minIncomingAssetAmount = 0
+
+    integrationData = encode_abi(
+        ['address[]', 'uint24[]', 'uint256', 'uint256'],
+        [pathAddresses, pathFees, outgoingAssetAmount, minIncomingAssetAmount]
+    )
+
+    # UniswapV3Adapter
+    adapter = enzyme_core_contracts["uniswap_v3_adapter"]
+    selector = bytes.fromhex("03e38a2b")
+
+    callArgs = encode_abi(
+        ['address', 'bytes4', 'bytes'],
+        [adapter.address, selector, integrationData]
+    )
+
+    integration_manager = enzyme_core_contracts["integration_manager"]
+    action_id = 0
+
+    comptroller = _get_comptroller(web3, new_fund)
+
+    comptroller.functions.callOnExtension(
+        integration_manager.address, action_id, callArgs
+    ).transact({"from": buyer})
+
+    # check that the vault has both USDT and WETH
+    vault_addr = new_fund.vaultProxy
+    usdt_bal = Contract.from_explorer(USDT).balanceOf(vault_addr) 
+    weth_bal = Contract.from_explorer(WETH).balanceOf(vault_addr) 
+
+    assert usdt_bal > 0 and weth_bal > 0
 
