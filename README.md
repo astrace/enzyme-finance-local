@@ -1,16 +1,19 @@
 Setting up local enzyme finance protocol instance for testing
 
-## Test
+## Testing
+
+0. Add desired test cases in `./tests/test_contracts.py`
 
 1. Setup local account
 ```
 >>> brownie accounts generate deployment_account
 ```
 
-2. Create `.env` file containing `WEB3_INFURA_PROJECT_ID`
+2. Create `.env` file containing:
+- `WEB3_INFURA_PROJECT_ID`
+- `ETHERSCAN_TOKEN`
 
-3. Add Etherscan API key
-
+3. Run
 ```
->>> brownie networks modify mainnet-fork explorer="https://api.etherscan.io/api?apikey=PTI588QGBZQWZ9RAF24C5UETQYHME6ZV45"
+brownie test --network mainnet-fork
 ```
